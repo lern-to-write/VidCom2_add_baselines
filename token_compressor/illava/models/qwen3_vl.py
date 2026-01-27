@@ -4,15 +4,16 @@ iLLaVA adaptation for Qwen3-VL model.
 iLLaVA applies token merging INSIDE the Vision Transformer progressively
 across multiple layers, not just after the ViT.
 
-Key features (following official implementation):
-- Use bipartite soft matching (same as ToMe) with alternating split
+ Key features (following official implementation):
+- Attention-based self-selection for token merging
 - Progressive merging at multiple layers inside ViT
-- Merge tokens using weighted averaging based on token size
+- Merge low-importance tokens using weighted averaging
 
 Reference: https://github.com/hulianyuyy/iLLaVA
 """
 
 from typing import Optional, Union, List, Tuple
+import math
 import os
 import torch
 import torch.nn.functional as F
@@ -21,109 +22,46 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModelOutputWithPast,
     is_torchdynamo_compiling,
+    apply_rotary_pos_emb_vision,
 )
 
-from token_compressor.illava.illava import bipartite_soft_matching, merge_wavg
-
-
-def _apply_illava_merging_in_vit(
+def _vision_attention_with_weights(
+    attn_module,
     hidden_states: Tensor,
     cu_seqlens: Tensor,
     position_embeddings: Tuple[Tensor, Tensor],
-    merge_ratio: float,
-    size: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tuple[Tensor, Tensor], Tensor]:
-    """
-    Apply iLLaVA bipartite soft matching inside the ViT.
-    
-    Following official ToMe/iLLaVA implementation with alternating split.
-    
-    Args:
-        hidden_states: Current hidden states [total_tokens, hidden_dim]
-        cu_seqlens: Cumulative sequence lengths
-        position_embeddings: (cos, sin) rotary embeddings
-        merge_ratio: Ratio of tokens to merge (e.g., 0.5 = merge 50%)
-        size: Token sizes for weighted averaging [total_tokens, 1]
-        
-    Returns:
-        merged_hidden: Merged hidden states
-        new_cu_seqlens: Updated cumulative sequence lengths
-        new_position_embeddings: Updated position embeddings
-        new_size: Updated token sizes
-    """
-    total_tokens, hidden_dim = hidden_states.shape
-    cos_emb, sin_emb = position_embeddings
-    
-    # Split by video segments
+) -> Tuple[Tensor, List[Tensor]]:
+    seq_length = hidden_states.shape[0]
+    query_states, key_states, value_states = (
+        attn_module.qkv(hidden_states)
+        .reshape(seq_length, 3, attn_module.num_heads, -1)
+        .permute(1, 0, 2, 3)
+        .unbind(0)
+    )
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-    
-    merged_segments = []
-    new_lengths = []
-    new_cos_list = []
-    new_sin_list = []
-    new_size_list = []
-    
+    attn_outputs = []
+    attn_weights_list = []
     offset = 0
     for seg_len in lengths:
-        # Extract segment
-        segment = hidden_states[offset:offset + seg_len].unsqueeze(0)  # [1, seg_len, hidden_dim]
-        seg_cos = cos_emb[offset:offset + seg_len]
-        seg_sin = sin_emb[offset:offset + seg_len]
-        
-        if size is not None:
-            seg_size = size[offset:offset + seg_len].unsqueeze(0)  # [1, seg_len, 1]
-        else:
-            seg_size = torch.ones(1, seg_len, 1, device=hidden_states.device, dtype=hidden_states.dtype)
-        
-        # Calculate how many tokens to merge
-        r = max(0, int(seg_len * merge_ratio / 2))  # /2 because max merge is 50%
-        
-        if r > 0 and seg_len > 2:
-            # Apply bipartite soft matching (official ToMe/iLLaVA)
-            merge_fn, _ = bipartite_soft_matching(segment, r=r)
-            
-            # Merge with weighted averaging
-            merged_segment, new_seg_size = merge_wavg(merge_fn, segment, seg_size)
-            
-            merged_segment = merged_segment[0]  # Remove batch dim
-            new_seg_size = new_seg_size[0]
-            new_len = merged_segment.shape[0]
-        else:
-            merged_segment = segment[0]
-            new_seg_size = seg_size[0]
-            new_len = seg_len
-        
-        merged_segments.append(merged_segment)
-        new_lengths.append(new_len)
-        new_size_list.append(new_seg_size)
-        
-        # Update position embeddings by uniform sampling
-        if new_len < seg_len:
-            pos_indices = torch.linspace(0, seg_len - 1, new_len, dtype=torch.long, device=hidden_states.device)
-        else:
-            pos_indices = torch.arange(new_len, device=hidden_states.device)
-        
-        new_cos_list.append(seg_cos[pos_indices])
-        new_sin_list.append(seg_sin[pos_indices])
-        
-        offset += seg_len
-    
-    # Concatenate all merged segments
-    merged_hidden = torch.cat(merged_segments, dim=0)
-    
-    # Update cu_seqlens
-    new_cu_seqlens = torch.zeros(len(new_lengths) + 1, dtype=torch.int32, device=cu_seqlens.device)
-    new_cu_seqlens[1:] = torch.tensor(new_lengths, device=cu_seqlens.device).cumsum(dim=0)
-    
-    # Update position embeddings
-    new_cos = torch.cat(new_cos_list, dim=0)
-    new_sin = torch.cat(new_sin_list, dim=0)
-    new_position_embeddings = (new_cos, new_sin)
-    
-    # Update size
-    new_size = torch.cat(new_size_list, dim=0)
-    
-    return merged_hidden, new_cu_seqlens, new_position_embeddings, new_size
+        end = offset + seg_len
+        q_seg = query_states[offset:end].transpose(0, 1)
+        k_seg = key_states[offset:end].transpose(0, 1)
+        v_seg = value_states[offset:end].transpose(0, 1)
+
+        attn_weights = torch.matmul(q_seg, k_seg.transpose(1, 2)) * attn_module.scaling
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_seg.dtype)
+        attn_output = torch.matmul(attn_weights, v_seg)
+
+        attn_outputs.append(attn_output.transpose(0, 1))
+        attn_weights_list.append(attn_weights)
+        offset = end
+
+    attn_output = torch.cat(attn_outputs, dim=0).reshape(seq_length, -1)
+    attn_output = attn_module.proj(attn_output)
+    return attn_output, attn_weights_list
 
 
 def _downsample_features_to_target(
@@ -200,39 +138,98 @@ def _get_video_features_with_illava_compression(
     ).cumsum(dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
     
-    # Token size tracking for weighted averaging
-    token_size = None  # Will be initialized on first merge
+    # Track whether merging has been applied (affects deepstack feature collection)
+    merging_applied = False
     
     # Process through vision blocks with progressive token merging
     deepstack_feature_lists = []
     num_blocks = len(visual_model.blocks)
     
+    merge_unit = visual_model.spatial_merge_size ** 2
+
     for layer_num, blk in enumerate(visual_model.blocks):
-        # Normal forward through the block
-        hidden_states = blk(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-        
-        # Apply iLLaVA token merging at specified layers
         if layer_num in merge_layers:
-            hidden_states, cu_seqlens, position_embeddings, token_size = \
-                _apply_illava_merging_in_vit(
-                    hidden_states,
-                    cu_seqlens,
-                    position_embeddings,
-                    merge_ratio_per_layer,
-                    token_size
-                )
-        
-        # Collect deepstack features
-        if hasattr(visual_model, 'deepstack_visual_indexes') and \
-           layer_num in visual_model.deepstack_visual_indexes:
-            deepstack_feature = visual_model.deepstack_merger_list[
-                visual_model.deepstack_visual_indexes.index(layer_num)
-            ](hidden_states)
-            deepstack_feature_lists.append(deepstack_feature)
+            attn_output, attn_weights_list = _vision_attention_with_weights(
+                blk.attn,
+                blk.norm1(hidden_states),
+                cu_seqlens,
+                position_embeddings,
+            )
+            hidden_states = hidden_states + attn_output
+
+            # Collect deepstack features BEFORE merging to preserve spatial structure
+            if hasattr(visual_model, 'deepstack_visual_indexes') and \
+               layer_num in visual_model.deepstack_visual_indexes and not merging_applied:
+                deepstack_feature = visual_model.deepstack_merger_list[
+                    visual_model.deepstack_visual_indexes.index(layer_num)
+                ](hidden_states)
+                deepstack_feature_lists.append(deepstack_feature)
+
+            new_hidden_states = []
+            new_cos_list = []
+            new_sin_list = []
+            new_cu_seqlens = [0]
+            offset = 0
+
+            for attn_weights in attn_weights_list:
+                image_token_length = attn_weights.shape[-1]
+                attn_weights_mean = attn_weights.mean(0)
+                if attn_weights_mean.ndim == 2:
+                    attn_weights_mean = attn_weights_mean.mean(0)
+
+                reduce_tokens_current = math.floor(merge_ratio_per_layer * image_token_length)
+                if reduce_tokens_current % merge_unit != 0:
+                    if reduce_tokens_current > merge_unit:
+                        reduce_tokens_current = (reduce_tokens_current // merge_unit) * merge_unit
+                    else:
+                        reduce_tokens_current = 0
+                reduce_tokens_current = min(reduce_tokens_current, max(image_token_length - 1, 0))
+
+                if reduce_tokens_current > 0:
+                    indice = attn_weights_mean.topk(reduce_tokens_current + 1, largest=False)[1]
+                    start_index = offset
+                    indice = indice + start_index
+                    values = hidden_states[indice]
+                    size = torch.arange(
+                        reduce_tokens_current + 1,
+                        0,
+                        -1,
+                        device=values.device,
+                        dtype=values.dtype,
+                    )
+                    merged = (size.float() @ values.float()) / size.float().sum().to(values.device)
+                    hidden_states[indice[-1]] = merged.to(values.dtype)
+
+                    set_all = set(range(start_index, start_index + image_token_length))
+                    set_excluded = set(indice[:-1].detach().cpu().numpy().tolist())
+                    set_selected = sorted(set_all - set_excluded)
+                else:
+                    set_selected = list(range(offset, offset + image_token_length))
+
+                new_hidden_states.append(hidden_states[set_selected])
+                new_cos_list.append(position_embeddings[0][set_selected])
+                new_sin_list.append(position_embeddings[1][set_selected])
+                new_cu_seqlens.append(new_cu_seqlens[-1] + image_token_length - reduce_tokens_current)
+                offset += image_token_length
+
+            hidden_states = torch.cat(new_hidden_states, dim=0)
+            position_embeddings = (torch.cat(new_cos_list, dim=0), torch.cat(new_sin_list, dim=0))
+            cu_seqlens = torch.tensor(new_cu_seqlens, dtype=torch.int32, device=hidden_states.device)
+
+            hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
+            merging_applied = True
+        else:
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+            )
+            if hasattr(visual_model, 'deepstack_visual_indexes') and \
+               layer_num in visual_model.deepstack_visual_indexes and not merging_applied:
+                deepstack_feature = visual_model.deepstack_merger_list[
+                    visual_model.deepstack_visual_indexes.index(layer_num)
+                ](hidden_states)
+                deepstack_feature_lists.append(deepstack_feature)
     
     # Get final token count before merger (this is what LLM will see)
     final_token_count = hidden_states.shape[0]
@@ -276,6 +273,7 @@ def Qwen3VLModel_forward(
     - R_RATIO: Token retention ratio (default: 0.25)
     - ILLAVA_MERGE_RATIO: Ratio of tokens to merge per layer (default: 0.5)
     - ILLAVA_LAYERS: Comma-separated layer indices for merging (default: auto)
+    - COMPRESS_IMAGE: Set to "1" to enable image compression (default: "0")
     """
 
     if (input_ids is None) ^ (inputs_embeds is not None):
@@ -289,14 +287,59 @@ def Qwen3VLModel_forward(
     deepstack_image_embeds = None
     deepstack_video_embeds = None
 
-    if pixel_values is not None:
-        image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-        image_mask, _ = self.get_placeholder_mask(
-            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-        )
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    # Check if image compression should be applied
+    image_compression_on = (
+        pixel_values is not None
+        and image_grid_thw is not None
+        and os.getenv("COMPRESS_IMAGE", "0") == "1"
+        and (past_key_values is None or past_key_values.get_seq_length() == 0)
+    )
 
+    if image_compression_on:
+        batch_size = inputs_embeds.shape[0]
+        if batch_size != 1:
+            image_compression_on = False
+
+    if pixel_values is not None:
+        if image_compression_on:
+            # Apply iLLaVA merging INSIDE the ViT for images
+            retention_ratio = float(os.getenv("R_RATIO", "0.25"))
+            merge_ratio_per_layer = float(os.getenv("ILLAVA_MERGE_RATIO", "0.5"))
+            
+            # Determine which layers to apply merging
+            num_blocks = len(self.visual.blocks)
+            merge_layers_str = os.getenv("ILLAVA_LAYERS")
+            if merge_layers_str:
+                merge_layers = [int(x) for x in merge_layers_str.split(",")]
+            else:
+                # Default: apply merging at multiple layers to achieve target ratio
+                merge_layers = [num_blocks // 3, 2 * num_blocks // 3]
+            
+            pixel_values_typed = pixel_values.type(self.visual.dtype)
+            image_embeds_raw, deepstack_image_embeds = _get_video_features_with_illava_compression(
+                self.visual,
+                pixel_values_typed,
+                image_grid_thw,
+                merge_layers,
+                merge_ratio_per_layer,
+                retention_ratio
+            )
+            
+            image_embeds = image_embeds_raw.to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            # Compute image_mask manually for sequence pruning
+            image_token_id = self.config.image_token_id
+            image_mask = (input_ids == image_token_id)
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        else:
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    # Check if video compression should be applied
     compression_on = (
         pixel_values_videos is not None
         and video_grid_thw is not None
@@ -393,7 +436,47 @@ def Qwen3VLModel_forward(
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+    # Helper function for attention mask pruning
+    def _prune_attention(attn: Optional[torch.Tensor], indices: torch.Tensor) -> Optional[torch.Tensor]:
+        if attn is None:
+            return None
+        if attn.dim() == 2:
+            return attn[:, indices]
+        if attn.dim() == 4:
+            return attn[:, :, indices, :][:, :, :, indices]
+        return attn
+
+    if image_compression_on:
+        # Prune sequence to match compressed image tokens
+        image_token_positions = image_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
+        num_compressed_image_tokens = len(image_embeds)
+        
+        all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        non_image_mask = ~image_mask[..., 0][0]
+        non_image_positions = all_positions[non_image_mask]
+        
+        kept_image_positions = image_token_positions[:num_compressed_image_tokens]
+        keep_token_indices = torch.cat((non_image_positions, kept_image_positions)).sort().values
+
+        inputs_embeds = inputs_embeds[:, keep_token_indices, :]
+        if input_ids is not None:
+            input_ids = input_ids[:, keep_token_indices]
+        attention_mask = (
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
+            if isinstance(attention_mask, dict)
+            else _prune_attention(attention_mask, keep_token_indices)
+        )
+        position_ids = position_ids[:, :, keep_token_indices]
+
+        if image_mask is not None:
+            image_mask = image_mask[:, keep_token_indices, :]
+        if video_mask is not None:
+            video_mask = video_mask[:, keep_token_indices, :]
+
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+
     if compression_on:
+        # Prune sequence to match compressed video tokens
         video_token_positions = video_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
         num_compressed_tokens = len(video_embeds)
         
@@ -404,22 +487,13 @@ def Qwen3VLModel_forward(
         kept_video_positions = video_token_positions[:num_compressed_tokens]
         keep_token_indices = torch.cat((non_video_positions, kept_video_positions)).sort().values
 
-        def _prune_attention(attn: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if attn is None:
-                return None
-            if attn.dim() == 2:
-                return attn[:, keep_token_indices]
-            if attn.dim() == 4:
-                return attn[:, :, keep_token_indices, :][:, :, :, keep_token_indices]
-            return attn
-
         inputs_embeds = inputs_embeds[:, keep_token_indices, :]
         if input_ids is not None:
             input_ids = input_ids[:, keep_token_indices]
         attention_mask = (
-            {k: _prune_attention(v) for k, v in attention_mask.items()}
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
             if isinstance(attention_mask, dict)
-            else _prune_attention(attention_mask)
+            else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
 

@@ -208,7 +208,7 @@ COMPRESSOR=holitom R_RATIO=0.15 HOLITOM_T=0.8 accelerate launch --num_processes=
 
 **Usage:**
 ```bash
-COMPRESSOR=ipcv R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 accelerate launch --num_processes=8 \
+COMPRESSOR=ipcv R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=8 \
   -m lmms_eval \
   --model qwen3_vl \
   --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2,max_num_frames=32 \
@@ -224,20 +224,21 @@ COMPRESSOR=ipcv R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 accelerate launch --n
 - `IPCV_LAYER`: ViT layer at which to start pruning (default: middle layer)
 - `IPCV_AS_LAYERS`: Number of AS restoration layers (default: 4)
 - `IPCV_TOP_K`: Number of nearest neighbors for delta computation (default: 10)
+- `COMPRESS_IMAGE`: Set to "1" to enable image compression (default: "0", video-only)
 
 ### iLLaVA (Token Merging for VLMs)
 
 **Paper:** [iLLaVA: An Image is Worth Fewer Tokens in Large Vision-Language Models](https://github.com/hulianyuyy/iLLaVA)
 
 **Key Features:**
-- Applies token merging **progressively INSIDE the ViT** at multiple layers
-- Uses bipartite soft matching to merge similar visual tokens
+- Applies token merging **inside the ViT** at specified layers
+- Uses attention-based self-selection to merge low-importance visual tokens
 - Remaining ViT layers continue processing merged tokens
 - Training-free, preserves important visual information
 
 **Usage:**
 ```bash
-COMPRESSOR=illava R_RATIO=0.25 ILLAVA_MERGE_RATIO=0.5 accelerate launch --num_processes=8 \
+COMPRESSOR=illava ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=8 \
   -m lmms_eval \
   --model qwen3_vl \
   --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2,max_num_frames=32 \
@@ -249,9 +250,11 @@ COMPRESSOR=illava R_RATIO=0.25 ILLAVA_MERGE_RATIO=0.5 accelerate launch --num_pr
 ```
 
 **Parameters:**
-- `R_RATIO`: Retention ratio (default: 0.25 for 25%)
-- `ILLAVA_MERGE_RATIO`: Ratio of tokens to merge per layer (default: 0.5)
-- `ILLAVA_LAYERS`: Comma-separated layer indices to apply merging (default: 1/3 and 2/3 of layers)
+- `ILLAVA_MERGE_RATIO`: Fraction of tokens to merge per layer (0-1); aligned with official `illava_vit_r` behavior
+- `ILLAVA_LAYERS`: Comma-separated ViT layer indices to apply merging (e.g., `12,13,14,15` for a 24-layer ViT)
+- `COMPRESS_IMAGE`: Set to "1" to enable image compression (default: "0", video-only)
+
+**Note:** This integration applies iLLaVA at the ViT stage only (LLM-stage merging from the official repo is not enabled here).
 
 ### ToMe (Token Merging)
 
@@ -280,6 +283,7 @@ COMPRESSOR=tome R_RATIO=0.25 TOME_R=8 TOME_APPLY_EVERY=2 accelerate launch --num
 - `R_RATIO`: Retention ratio (default: 0.25 for 25%)
 - `TOME_R`: Number of tokens to merge per layer (auto-computed if not set)
 - `TOME_APPLY_EVERY`: Apply merging every N layers (default: 2)
+- `COMPRESS_IMAGE`: Set to "1" to enable image compression (default: "0", video-only)
 
 ### Pooling (Spatial Pooling)
 
@@ -306,19 +310,17 @@ COMPRESSOR=pooling R_RATIO=0.25 POOLING_TYPE=avg POOLING_LAYER=14 accelerate lau
 - `R_RATIO`: Retention ratio (default: 0.25 for 25%)
 - `POOLING_TYPE`: Pooling type - "avg", "max", or "stride" (default: avg)
 - `POOLING_LAYER`: ViT layer after which to apply pooling (default: middle layer)
-
 ### Comparison of Methods
 
-| Method | Compression Stage | Strategy |
-| --- | --- | --- |
-| **VidCom<sup>2</sup>** (Ours) | After vision encoder | Gaussian similarity + dynamic frame budget |
-| **FastV** | Inside LLM (layer K) | Attention-based pruning |
-| **VisionZip** | After vision encoder | Dominant token + density merging |
-| **HoliTom(w/o M)** | After vision encoder | Temporal segmentation + DPC-KNN merging |
-| **IPCV** | **Inside ViT** (layer K + AS layers) | Diff-based pruning + multi-layer AS restoration |
-| **iLLaVA** | **Inside ViT** (multiple layers) | Progressive bipartite soft matching |
-| **ToMe** | **Inside ViT** (every N layers) | Bipartite matching per block |
-| **Pooling** | **Inside ViT** (layer K) | Spatial pooling (avg/max/stride) |
+| Compression Position | Method | Compression Stage | Strategy |
+| :--- | :--- | :--- | :--- |
+| **inner vit** | **IPCV** | Inside ViT (layer K + AS layers) | Diff-based pruning + multi-layer AS restoration |
+| | **iLLaVA** | Inside ViT (multiple layers) | Attention-guided token merging |
+| | **ToMe** | Inside ViT (every N layers) | Bipartite matching per block |
+| **after vit** | **VidCom²** | After vision encoder | Gaussian similarity + dynamic frame budget |
+| | **HoliTom(w/o M)** | After vision encoder | Temporal segmentation + DPC-KNN merging |
+| | **VisionZip** | After vision encoder | Dominant token + density merging |
+| **inner llm** | **FastV** | Inside LLM (layer K) | Attention-based pruning |
 
 **Implementation Location:**
 - VidCom<sup>2</sup>: [`token_compressor/vidcom2/`](token_compressor/vidcom2/)
@@ -329,6 +331,48 @@ COMPRESSOR=pooling R_RATIO=0.25 POOLING_TYPE=avg POOLING_LAYER=14 accelerate lau
 - iLLaVA: [`token_compressor/illava/`](token_compressor/illava/)
 - ToMe: [`token_compressor/tome/`](token_compressor/tome/)
 - Pooling: [`token_compressor/pooling/`](token_compressor/pooling/)
+
+### Image Compression Support
+
+By default, the ViT-based compression methods (IPCV, iLLaVA, ToMe) only compress **video tokens**. To enable compression for **single-image tasks**, set the `COMPRESS_IMAGE` environment variable to `1`.
+
+**Usage Example (Image Tasks):**
+```bash
+# IPCV with image compression enabled
+COMPRESSOR=ipcv COMPRESS_IMAGE=1 R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=8 \
+  -m lmms_eval \
+  --model qwen3_vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --log_samples_suffix qwen3_vl_ipcv_image \
+  --output_path ./logs/
+
+# iLLaVA with image compression enabled
+COMPRESSOR=illava COMPRESS_IMAGE=1 ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=8 \
+  -m lmms_eval \
+  --model qwen3_vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --log_samples_suffix qwen3_vl_illava_image \
+  --output_path ./logs/
+
+# ToMe with image compression enabled
+COMPRESSOR=tome COMPRESS_IMAGE=1 R_RATIO=0.25 accelerate launch --num_processes=8 \
+  -m lmms_eval \
+  --model qwen3_vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --log_samples_suffix qwen3_vl_tome_image \
+  --output_path ./logs/
+```
+
+**Note:** When `COMPRESS_IMAGE=1` is set, the same compression parameters (e.g., `R_RATIO`, `IPCV_LAYER`, `ILLAVA_MERGE_RATIO`) are applied to both images and videos.
 
 ## 🔄 Batch Baseline Comparison
 

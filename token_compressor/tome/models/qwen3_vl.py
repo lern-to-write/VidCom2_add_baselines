@@ -98,6 +98,9 @@ def _get_video_features_with_tome_compression(
     ).cumsum(dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
     
+    # Track whether merging has been applied (affects deepstack feature collection)
+    merging_applied = False
+    
     # Process through vision blocks with ToMe merging
     deepstack_feature_lists = []
     num_blocks = len(visual_model.blocks)
@@ -110,6 +113,15 @@ def _get_video_features_with_tome_compression(
             position_embeddings=position_embeddings,
         )
         
+        # Collect deepstack features BEFORE merging to preserve spatial structure
+        # The deepstack_merger expects the original spatial layout (spatial_merge_size^2 grouping)
+        # which is broken after token merging
+        if layer_num in visual_model.deepstack_visual_indexes and not merging_applied:
+            deepstack_feature = visual_model.deepstack_merger_list[
+                visual_model.deepstack_visual_indexes.index(layer_num)
+            ](hidden_states)
+            deepstack_feature_lists.append(deepstack_feature)
+        
         # Apply ToMe merging after this block
         if (layer_num + 1) % apply_every_n_layers == 0 and layer_num < num_blocks - 1:
             hidden_states, cu_seqlens, position_embeddings = \
@@ -119,13 +131,7 @@ def _get_video_features_with_tome_compression(
                     position_embeddings,
                     r_per_layer
                 )
-        
-        # Collect deepstack features
-        if layer_num in visual_model.deepstack_visual_indexes:
-            deepstack_feature = visual_model.deepstack_merger_list[
-                visual_model.deepstack_visual_indexes.index(layer_num)
-            ](hidden_states)
-            deepstack_feature_lists.append(deepstack_feature)
+            merging_applied = True
     
     # Final merger for hidden states
     hidden_states = visual_model.merger(hidden_states)
@@ -322,7 +328,15 @@ def Qwen3VLModel_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
-    """Patched forward with ToMe token merging INSIDE the ViT."""
+    """
+    Patched forward with ToMe token merging INSIDE the ViT.
+    
+    Configuration via environment variables:
+    - R_RATIO: Token retention ratio (default: 0.25)
+    - TOME_R: Tokens to merge per layer (overrides auto calculation)
+    - TOME_APPLY_EVERY: Apply merging every N layers (default: 2)
+    - COMPRESS_IMAGE: Set to "1" to enable image compression (default: "0")
+    """
 
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -335,14 +349,67 @@ def Qwen3VLModel_forward(
     deepstack_image_embeds = None
     deepstack_video_embeds = None
 
-    if pixel_values is not None:
-        image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-        image_mask, _ = self.get_placeholder_mask(
-            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-        )
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    # Check if image compression should be applied
+    image_compression_on = (
+        pixel_values is not None
+        and image_grid_thw is not None
+        and os.getenv("COMPRESS_IMAGE", "0") == "1"
+        and (past_key_values is None or past_key_values.get_seq_length() == 0)
+    )
 
+    if image_compression_on:
+        batch_size = inputs_embeds.shape[0]
+        if batch_size != 1:
+            image_compression_on = False
+
+    if pixel_values is not None:
+        if image_compression_on:
+            # Apply ToMe merging INSIDE the ViT for images
+            retention_ratio = float(os.getenv("R_RATIO", "0.25"))
+            
+            # Calculate r (tokens to merge per layer) to achieve target retention
+            num_blocks = len(self.visual.blocks)
+            merge_size = self.visual.spatial_merge_size
+            original_tokens_per_image = (image_grid_thw.prod(-1) // merge_size**2).sum().item()
+            target_tokens = int(original_tokens_per_image * retention_ratio)
+            total_to_remove = original_tokens_per_image - target_tokens
+            
+            # TOME_R: tokens to merge per layer (overrides auto calculation)
+            tome_r_env = os.getenv("TOME_R")
+            if tome_r_env:
+                r_per_layer = int(tome_r_env)
+            else:
+                # Auto calculate: distribute merges across layers
+                apply_every = int(os.getenv("TOME_APPLY_EVERY", "2"))
+                num_merge_points = num_blocks // apply_every
+                r_per_layer = max(1, total_to_remove // max(1, num_merge_points))
+            
+            apply_every_n_layers = int(os.getenv("TOME_APPLY_EVERY", "2"))
+            
+            pixel_values_typed = pixel_values.type(self.visual.dtype)
+            image_embeds_raw, deepstack_image_embeds = _get_video_features_with_tome_compression(
+                self.visual,
+                pixel_values_typed,
+                image_grid_thw,
+                r_per_layer,
+                apply_every_n_layers
+            )
+            
+            image_embeds = image_embeds_raw.to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            # Compute image_mask manually for sequence pruning
+            image_token_id = self.config.image_token_id
+            image_mask = (input_ids == image_token_id)
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        else:
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    # Check if video compression should be applied
     compression_on = (
         pixel_values_videos is not None
         and video_grid_thw is not None
@@ -448,7 +515,47 @@ def Qwen3VLModel_forward(
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+    # Helper function for attention mask pruning
+    def _prune_attention(attn: Optional[torch.Tensor], indices: torch.Tensor) -> Optional[torch.Tensor]:
+        if attn is None:
+            return None
+        if attn.dim() == 2:
+            return attn[:, indices]
+        if attn.dim() == 4:
+            return attn[:, :, indices, :][:, :, :, indices]
+        return attn
+
+    if image_compression_on:
+        # Prune sequence to match compressed image tokens
+        image_token_positions = image_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
+        num_compressed_image_tokens = len(image_embeds)
+        
+        all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        non_image_mask = ~image_mask[..., 0][0]
+        non_image_positions = all_positions[non_image_mask]
+        
+        kept_image_positions = image_token_positions[:num_compressed_image_tokens]
+        keep_token_indices = torch.cat((non_image_positions, kept_image_positions)).sort().values
+
+        inputs_embeds = inputs_embeds[:, keep_token_indices, :]
+        if input_ids is not None:
+            input_ids = input_ids[:, keep_token_indices]
+        attention_mask = (
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
+            if isinstance(attention_mask, dict)
+            else _prune_attention(attention_mask, keep_token_indices)
+        )
+        position_ids = position_ids[:, :, keep_token_indices]
+
+        if image_mask is not None:
+            image_mask = image_mask[:, keep_token_indices, :]
+        if video_mask is not None:
+            video_mask = video_mask[:, keep_token_indices, :]
+
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+
     if compression_on:
+        # Prune sequence to match compressed video tokens
         video_token_positions = video_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
         num_compressed_tokens = len(video_embeds)
         
@@ -459,22 +566,13 @@ def Qwen3VLModel_forward(
         kept_video_positions = video_token_positions[:num_compressed_tokens]
         keep_token_indices = torch.cat((non_video_positions, kept_video_positions)).sort().values
 
-        def _prune_attention(attn: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if attn is None:
-                return None
-            if attn.dim() == 2:
-                return attn[:, keep_token_indices]
-            if attn.dim() == 4:
-                return attn[:, :, keep_token_indices, :][:, :, :, keep_token_indices]
-            return attn
-
         inputs_embeds = inputs_embeds[:, keep_token_indices, :]
         if input_ids is not None:
             input_ids = input_ids[:, keep_token_indices]
         attention_mask = (
-            {k: _prune_attention(v) for k, v in attention_mask.items()}
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
             if isinstance(attention_mask, dict)
-            else _prune_attention(attention_mask)
+            else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
 

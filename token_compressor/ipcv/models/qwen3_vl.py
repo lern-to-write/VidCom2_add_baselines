@@ -258,6 +258,7 @@ def Qwen3VLModel_forward(
     - IPCV_LAYER: Layer at which to start pruning (default: num_blocks // 2)
     - IPCV_AS_LAYERS: Number of AS restoration layers (default: 4)
     - IPCV_TOP_K: Number of nearest neighbors for delta (official default: 10)
+    - COMPRESS_IMAGE: Set to "1" to enable image compression (default: "0")
     """
 
     if (input_ids is None) ^ (inputs_embeds is not None):
@@ -271,15 +272,56 @@ def Qwen3VLModel_forward(
     deepstack_image_embeds = None
     deepstack_video_embeds = None
 
-    if pixel_values is not None:
-        image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-        image_mask, _ = self.get_placeholder_mask(
-            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-        )
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    # Check if image compression should be applied
+    image_compression_on = (
+        pixel_values is not None
+        and image_grid_thw is not None
+        and os.getenv("COMPRESS_IMAGE", "0") == "1"
+        and (past_key_values is None or past_key_values.get_seq_length() == 0)
+    )
 
-    # Check if IPCV compression should be applied
+    if image_compression_on:
+        batch_size = inputs_embeds.shape[0]
+        if batch_size != 1:
+            image_compression_on = False
+
+    if pixel_values is not None:
+        if image_compression_on:
+            # IPCV configuration (following official defaults)
+            retention_ratio = float(os.getenv("R_RATIO", "0.25"))
+            num_blocks = len(self.visual.blocks)
+            default_layer = num_blocks // 2
+            prune_layer = int(os.getenv("IPCV_LAYER", str(default_layer)))
+            as_layers = int(os.getenv("IPCV_AS_LAYERS", "4"))
+            top_k = int(os.getenv("IPCV_TOP_K", "10"))
+            
+            # Apply IPCV compression INSIDE the ViT for images
+            pixel_values_typed = pixel_values.type(self.visual.dtype)
+            image_embeds_raw, deepstack_image_embeds = _get_video_features_with_ipcv_compression(
+                self.visual,
+                pixel_values_typed,
+                image_grid_thw,
+                prune_layer,
+                retention_ratio,
+                as_layers,
+                top_k,
+            )
+            
+            image_embeds = image_embeds_raw.to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            # Compute image_mask manually for sequence pruning
+            image_token_id = self.config.image_token_id
+            image_mask = (input_ids == image_token_id)
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        else:
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+    # Check if IPCV compression should be applied for videos
     compression_on = (
         pixel_values_videos is not None
         and video_grid_thw is not None
@@ -365,6 +407,45 @@ def Qwen3VLModel_forward(
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+    # Helper function for attention mask pruning
+    def _prune_attention(attn: Optional[torch.Tensor], indices: torch.Tensor) -> Optional[torch.Tensor]:
+        if attn is None:
+            return None
+        if attn.dim() == 2:
+            return attn[:, indices]
+        if attn.dim() == 4:
+            return attn[:, :, indices, :][:, :, :, indices]
+        return attn
+
+    if image_compression_on:
+        # Prune sequence to match compressed image tokens
+        image_token_positions = image_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
+        num_compressed_image_tokens = len(image_embeds)
+        
+        all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        non_image_mask = ~image_mask[..., 0][0]
+        non_image_positions = all_positions[non_image_mask]
+        
+        kept_image_positions = image_token_positions[:num_compressed_image_tokens]
+        keep_token_indices = torch.cat((non_image_positions, kept_image_positions)).sort().values
+
+        inputs_embeds = inputs_embeds[:, keep_token_indices, :]
+        if input_ids is not None:
+            input_ids = input_ids[:, keep_token_indices]
+        attention_mask = (
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
+            if isinstance(attention_mask, dict)
+            else _prune_attention(attention_mask, keep_token_indices)
+        )
+        position_ids = position_ids[:, :, keep_token_indices]
+
+        if image_mask is not None:
+            image_mask = image_mask[:, keep_token_indices, :]
+        if video_mask is not None:
+            video_mask = video_mask[:, keep_token_indices, :]
+
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+
     if compression_on:
         # Prune sequence to match compressed video tokens
         video_token_positions = video_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
@@ -377,22 +458,13 @@ def Qwen3VLModel_forward(
         kept_video_positions = video_token_positions[:num_compressed_tokens]
         keep_token_indices = torch.cat((non_video_positions, kept_video_positions)).sort().values
 
-        def _prune_attention(attn: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if attn is None:
-                return None
-            if attn.dim() == 2:
-                return attn[:, keep_token_indices]
-            if attn.dim() == 4:
-                return attn[:, :, keep_token_indices, :][:, :, :, keep_token_indices]
-            return attn
-
         inputs_embeds = inputs_embeds[:, keep_token_indices, :]
         if input_ids is not None:
             input_ids = input_ids[:, keep_token_indices]
         attention_mask = (
-            {k: _prune_attention(v) for k, v in attention_mask.items()}
+            {k: _prune_attention(v, keep_token_indices) for k, v in attention_mask.items()}
             if isinstance(attention_mask, dict)
-            else _prune_attention(attention_mask)
+            else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
 

@@ -1,33 +1,32 @@
 # Repository Guidelines
-用中文回复
+
 ## Project Structure & Module Organization
-- `lmms_eval/`: core evaluation harness, CLI entrypoint, models, tasks, and metrics.
-- `token_compressor/`: VidCom2 implementation plus baseline compressors and model adapters.
-- `examples/`: runnable scripts (e.g., `examples/models/*.sh`) and usage templates.
-- `docs/`: command reference, model/task guides, and versioned docs.
-- `tools/` and `miscs/`: dataset utilities, experiments, and ad-hoc scripts (see `miscs/test_*.py`).
+- `lmms_eval/`: evaluation harness, CLI entrypoint, tasks, metrics, and model adapters.
+- `token_compressor/`: VidCom2 and baseline compression methods (e.g., IPCV, iLLaVA, CDPruner) plus model patches.
+- `examples/` and `scripts/`: runnable examples and batch scripts for evaluations.
+- `docs/`: usage notes and reference docs.
+- `miscs/` and `tools/`: utilities and lightweight checks (look for `miscs/test_*.py`).
 
 ## Build, Test, and Development Commands
-- `pip install -e .` installs the package in editable mode (per `README.md`).
-- `python -m lmms_eval --help` shows CLI flags; `lmms-eval` is the console entrypoint.
-- Example run (short sanity):  
-  `python -m lmms_eval --model qwen3_vl --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct --tasks videomme --batch_size 1 --limit 8 --output_path ./logs`
-- `accelerate launch -m lmms_eval ...` is used for multi-GPU runs (see `README.md` examples).
+- `uv sync` to create/update the environment from `uv.lock`.
+- Run evaluations with `python -m lmms_eval ...` (single GPU) or `accelerate launch -m lmms_eval ...` (multi-GPU).
+- Tooling: `uv run ruff format .`, `uv run ruff check .`, `uv run pyright`, `uv run pytest`.
 
 ## Coding Style & Naming Conventions
-- Python project; follow PEP 8 naming (snake_case functions, PascalCase classes).
-- Formatting: Black with `--line-length=240`, import sorting via isort (`--profile black`) per `.pre-commit-config.yaml`.
-- Prefer type hints and docstrings for public APIs; keep functions focused and small (see `CLAUDE.md`).
+- Follow PEP 8 naming (snake_case functions, PascalCase classes).
+- Line length: 88 chars (per `CLAUDE.md`); use ruff for formatting.
+- Add type hints and docstrings for public APIs; keep functions focused and small.
 
 ## Testing Guidelines
-- There is no dedicated `tests/` tree; lightweight checks live in `miscs/test_*.py`.
-- For fast regressions, run an eval with `--limit` and a small batch size.
-- If you add tests, keep them minimal and runnable via `pytest` (`uv run pytest` per `CLAUDE.md`).
+- Primary framework: `uv run pytest`.
+- For quick sanity checks, run a small eval with `--limit` and `--batch_size 1`.
+- Add regression tests for bug fixes; keep tests minimal and fast.
 
 ## Commit & Pull Request Guidelines
-- Recent commits use short, sentence-style messages without prefixes or ticket IDs (e.g., “Support FastV...”).
-- If your work is tied to a user report or GitHub issue, add trailers like `Reported-by:` or `Github-Issue:#` (per `CLAUDE.md`).
-- PRs should explain the problem and the high-level solution; include key commands or results when relevant.
+- Use short, sentence-style commit messages.
+- Add trailers when applicable: `Reported-by:<name>` or `Github-Issue:#<num>` (see `CLAUDE.md`).
+- PRs should explain the problem, solution, and key commands/results.
 
-## Agent-Specific Notes
-- `CLAUDE.md` contains stricter workflow rules (uv-first tooling, type checks, linting). Follow it when working in that toolchain.
+## Configuration & Runtime Tips
+- Compression is controlled via env vars (e.g., `COMPRESSOR`, `R_RATIO`, `COMPRESS_IMAGE`, method-specific knobs).
+- Keep changes scoped to the task; avoid unrelated refactors.

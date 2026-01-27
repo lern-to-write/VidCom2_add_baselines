@@ -159,6 +159,12 @@ class Qwen3_VL(lmms):
             r_ratio = os.getenv("R_RATIO", "0.25")
             merge_ratio = os.getenv("ILLAVA_MERGE_RATIO", "0.5")
             eval_logger.success(f"[iLLaVA] Successfully integrated iLLaVA with Qwen3-VL. Merging INSIDE ViT progressively. (R_RATIO={r_ratio}, MERGE_RATIO={merge_ratio})")
+        elif compressor == "cdpruner":
+            import types
+            from token_compressor.cdpruner.models.qwen3_vl import Qwen3VLModel_forward
+            self._model.model.forward = types.MethodType(Qwen3VLModel_forward, self._model.model)
+            visual_tokens = os.getenv("CDPRUNER_TOKENS", "all")
+            eval_logger.success(f"[CDPruner] Successfully integrated CDPruner with Qwen3-VL. (CDPRUNER_TOKENS={visual_tokens})")
         elif compressor == "tome":
             import types
             from token_compressor.tome.models.qwen3_vl import Qwen3VLModel_forward

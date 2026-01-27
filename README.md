@@ -256,6 +256,32 @@ COMPRESSOR=illava ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate l
 
 **Note:** This integration applies iLLaVA at the ViT stage only (LLM-stage merging from the official repo is not enabled here).
 
+### CDPruner (Conditional DPP Pruning)
+
+**Paper:** [CDPruner: Conditional Diversity Pruner for MLLMs](https://arxiv.org/abs/2506.10967) | [Code](https://github.com/Theia-4869/CDPruner)
+
+**Key Features:**
+- Text-conditioned visual token selection
+- Uses conditional DPP to balance relevance and diversity
+- Training-free, applied after the vision encoder
+
+**Usage:**
+```bash
+COMPRESSOR=cdpruner COMPRESS_IMAGE=1 CDPRUNER_TOKENS=128 accelerate launch --num_processes=8 \
+  -m lmms_eval \
+  --model qwen3_vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --log_samples_suffix qwen3_vl_cdpruner \
+  --output_path ./logs/
+```
+
+**Parameters:**
+- `CDPRUNER_TOKENS`: Number of visual tokens to keep per image (set to match your target budget)
+- `COMPRESS_IMAGE`: Set to "1" to enable image pruning (default: "0")
+
 ### ToMe (Token Merging)
 
 **Paper:** [Token Merging: Your ViT But Faster](https://github.com/facebookresearch/ToMe) (ICLR 2023)
@@ -317,7 +343,8 @@ COMPRESSOR=pooling R_RATIO=0.25 POOLING_TYPE=avg POOLING_LAYER=14 accelerate lau
 | **inner vit** | **IPCV** | Inside ViT (layer K + AS layers) | Diff-based pruning + multi-layer AS restoration |
 | | **iLLaVA** | Inside ViT (multiple layers) | Attention-guided token merging |
 | | **ToMe** | Inside ViT (every N layers) | Bipartite matching per block |
-| **after vit** | **VidCom²** | After vision encoder | Gaussian similarity + dynamic frame budget |
+| **after vit** | **CDPruner** | After vision encoder | Conditional DPP pruning (relevance + diversity) |
+| | **VidCom²** | After vision encoder | Gaussian similarity + dynamic frame budget |
 | | **HoliTom(w/o M)** | After vision encoder | Temporal segmentation + DPC-KNN merging |
 | | **VisionZip** | After vision encoder | Dominant token + density merging |
 | **inner llm** | **FastV** | Inside LLM (layer K) | Attention-based pruning |
@@ -331,10 +358,11 @@ COMPRESSOR=pooling R_RATIO=0.25 POOLING_TYPE=avg POOLING_LAYER=14 accelerate lau
 - iLLaVA: [`token_compressor/illava/`](token_compressor/illava/)
 - ToMe: [`token_compressor/tome/`](token_compressor/tome/)
 - Pooling: [`token_compressor/pooling/`](token_compressor/pooling/)
+- CDPruner: [`token_compressor/cdpruner/`](token_compressor/cdpruner/)
 
 ### Image Compression Support
 
-By default, the ViT-based compression methods (IPCV, iLLaVA, ToMe) only compress **video tokens**. To enable compression for **single-image tasks**, set the `COMPRESS_IMAGE` environment variable to `1`.
+By default, the ViT-based compression methods (IPCV, iLLaVA, ToMe) only compress **video tokens**. To enable compression for **single-image tasks**, set the `COMPRESS_IMAGE` environment variable to `1`. CDPruner is image-only and also requires `COMPRESS_IMAGE=1`.
 
 **Usage Example (Image Tasks):**
 ```bash
@@ -369,6 +397,17 @@ COMPRESSOR=tome COMPRESS_IMAGE=1 R_RATIO=0.25 accelerate launch --num_processes=
   --batch_size 1 \
   --log_samples \
   --log_samples_suffix qwen3_vl_tome_image \
+  --output_path ./logs/
+
+# CDPruner with image compression enabled
+COMPRESSOR=cdpruner COMPRESS_IMAGE=1 CDPRUNER_TOKENS=128 accelerate launch --num_processes=8 \
+  -m lmms_eval \
+  --model qwen3_vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --tasks mme \
+  --batch_size 1 \
+  --log_samples \
+  --log_samples_suffix qwen3_vl_cdpruner_image \
   --output_path ./logs/
 ```
 

@@ -222,4 +222,14 @@ def illava_compression(
         r_per_step=r_per_step
     )
     
+    # Print compression info
+    final_length = compressed_features.shape[1]
+    compression_ratio = final_length / seq_len * 100
+    print(f"[iLLaVA] Token Merging Applied:")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Original tokens per sample: {seq_len}")
+    print(f"  - Merged tokens per sample: {final_length}")
+    print(f"  - Tokens reduced: {seq_len - final_length}")
+    print(f"  - Retention ratio: {compression_ratio:.2f}%")
+    
     return compressed_features, keep_indices

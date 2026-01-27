@@ -193,6 +193,16 @@ class IPCVState:
         self.is_pruned = True
         self.layers_after_prune = 0
         
+        # Print compression info
+        num_kept = len(self.keep_indices)
+        num_removed = len(self.remove_indices)
+        compression_ratio = num_kept / self.orig_seq_len * 100
+        print(f"[IPCV] Token Compression Applied:")
+        print(f"  - Original tokens: {self.orig_seq_len}")
+        print(f"  - Kept tokens: {num_kept}")
+        print(f"  - Removed tokens: {num_removed}")
+        print(f"  - Retention ratio: {compression_ratio:.2f}%")
+        
         return kept_states
     
     def restore_for_as(
@@ -342,5 +352,14 @@ def ipcv_compression(
     
     compressed_features = torch.stack(compressed_list, dim=0)
     keep_indices = torch.stack(indices_list, dim=0)
+    
+    # Print compression info
+    compression_ratio = num_keep / seq_len * 100
+    print(f"[IPCV Simple] Token Compression Applied:")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Original tokens per sample: {seq_len}")
+    print(f"  - Kept tokens per sample: {num_keep}")
+    print(f"  - Removed tokens per sample: {seq_len - num_keep}")
+    print(f"  - Retention ratio: {compression_ratio:.2f}%")
     
     return compressed_features, keep_indices

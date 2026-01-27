@@ -92,10 +92,10 @@ COMPRESSOR=vidcom2 R_RATIO=0.25 accelerate launch --num_processes=8 \
 
 ### Qwen3-VL
 ```bash
-COMPRESSOR=vidcom2 R_RATIO=0.25 accelerate launch --num_processes=8 \
+COMPRESSOR=vidcom2 R_RATIO=0.25 accelerate launch --num_processes=4 \
   -m lmms_eval \
   --model qwen3_vl \
-  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2,max_num_frames=32 \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa,max_num_frames=32 \
   --tasks videomme \
   --batch_size 1 \
   --log_samples \
@@ -208,7 +208,7 @@ COMPRESSOR=holitom R_RATIO=0.15 HOLITOM_T=0.8 accelerate launch --num_processes=
 
 **Usage:**
 ```bash
-COMPRESSOR=ipcv R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=8 \
+COMPRESSOR=ipcv R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=4 \
   -m lmms_eval \
   --model qwen3_vl \
   --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2,max_num_frames=32 \
@@ -367,10 +367,10 @@ By default, the ViT-based compression methods (IPCV, iLLaVA, ToMe) only compress
 **Usage Example (Image Tasks):**
 ```bash
 # IPCV with image compression enabled
-COMPRESSOR=ipcv COMPRESS_IMAGE=1 R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=8 \
+CUDA_VISIBLE_DEVICES=6,7 COMPRESSOR=ipcv COMPRESS_IMAGE=1 R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV_TOP_K=10 accelerate launch --num_processes=2 \
   -m lmms_eval \
   --model qwen3_vl \
-  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa \
   --tasks mme \
   --batch_size 1 \
   --log_samples \
@@ -378,10 +378,10 @@ COMPRESSOR=ipcv COMPRESS_IMAGE=1 R_RATIO=0.25 IPCV_LAYER=5 IPCV_AS_LAYERS=4 IPCV
   --output_path ./logs/
 
 # iLLaVA with image compression enabled
-COMPRESSOR=illava COMPRESS_IMAGE=1 ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=8 \
+CUDA_VISIBLE_DEVICES=6,7 COMPRESSOR=illava COMPRESS_IMAGE=1 ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=2 \
   -m lmms_eval \
   --model qwen3_vl \
-  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa \
   --tasks mme \
   --batch_size 1 \
   --log_samples \
@@ -400,10 +400,10 @@ COMPRESSOR=tome COMPRESS_IMAGE=1 R_RATIO=0.25 accelerate launch --num_processes=
   --output_path ./logs/
 
 # CDPruner with image compression enabled
-COMPRESSOR=cdpruner COMPRESS_IMAGE=1 CDPRUNER_TOKENS=128 accelerate launch --num_processes=8 \
+CUDA_VISIBLE_DEVICES=7 COMPRESSOR=cdpruner COMPRESS_IMAGE=1 CDPRUNER_TOKENS=128 accelerate launch --num_processes=1 \
   -m lmms_eval \
   --model qwen3_vl \
-  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=flash_attention_2 \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa \
   --tasks mme \
   --batch_size 1 \
   --log_samples \

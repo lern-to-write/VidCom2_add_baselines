@@ -29,7 +29,8 @@ def _compute_text_embeds(
 ) -> Tensor:
     mask = torch.ones_like(input_ids, dtype=torch.bool)
     if attention_mask is not None and not isinstance(attention_mask, dict):
-        if attention_mask.dim() == 2:
+        if attention_mask.dim() == 2 and attention_mask.shape[1] == input_ids.shape[1]:    
+            
             mask &= attention_mask.bool()
     mask &= input_ids != image_token_id
     mask &= input_ids != video_token_id
@@ -159,18 +160,38 @@ def Qwen3VLModel_forward(
             kept_deepstack: List[List[Tensor]] = [[] for _ in deepstack_splits]
             offset = 0
 
+            total_original_tokens = 0
+            total_kept_tokens = 0
             for image_idx, image_feat in enumerate(image_embeds_list):
-                keep_tokens = visual_token_num if visual_token_num > 0 else image_feat.shape[0]
+                original_tokens = image_feat.shape[0]
+                keep_tokens = visual_token_num if visual_token_num > 0 else original_tokens
                 keep_local = _cdpruner_select_indices(image_feat, text_embeds[0], keep_tokens)
                 kept_indices.append(keep_local + offset)
                 kept_image_chunks.append(image_feat[keep_local])
                 for layer_idx, layer_splits in enumerate(deepstack_splits):
                     layer_chunk = layer_splits[image_idx]
                     kept_deepstack[layer_idx].append(layer_chunk[keep_local])
-                offset += image_feat.shape[0]
+                offset += original_tokens
+                total_original_tokens += original_tokens
+                total_kept_tokens += len(keep_local)
+                
+                # Print per-image compression info
+                print(f"[CDPruner] Image {image_idx + 1} compression:")
+                print(f"  - Original tokens: {original_tokens}")
+                print(f"  - Kept tokens: {len(keep_local)}")
+                print(f"  - Removed tokens: {original_tokens - len(keep_local)}")
+                print(f"  - Retention ratio: {len(keep_local) / original_tokens * 100:.2f}%")
 
             image_keep_indices = torch.sort(torch.cat(kept_indices)).values
             image_embeds = torch.cat(kept_image_chunks, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            
+            # Print total compression summary
+            print(f"[CDPruner] Total Token Compression Summary:")
+            print(f"  - Total images: {len(image_embeds_list)}")
+            print(f"  - Total original tokens: {total_original_tokens}")
+            print(f"  - Total kept tokens: {total_kept_tokens}")
+            print(f"  - Total removed tokens: {total_original_tokens - total_kept_tokens}")
+            print(f"  - Overall retention ratio: {total_kept_tokens / total_original_tokens * 100:.2f}%")
             if kept_deepstack:
                 deepstack_image_embeds = [torch.cat(chunks, dim=0) for chunks in kept_deepstack]
 
@@ -261,6 +282,12 @@ def Qwen3VLModel_forward(
             else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
+        if cache_position is not None:
+            cache_position = torch.arange(
+                inputs_embeds.shape[1], 
+                device=inputs_embeds.device, 
+                dtype=cache_position.dtype
+            )
 
         if image_mask is not None:
             image_mask = image_mask[:, keep_token_indices, :]

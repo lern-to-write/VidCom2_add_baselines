@@ -467,6 +467,12 @@ def Qwen3VLModel_forward(
             else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
+        if cache_position is not None:
+            cache_position = torch.arange(
+                inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+                dtype=cache_position.dtype
+            )
 
         if image_mask is not None:
             image_mask = image_mask[:, keep_token_indices, :]
@@ -496,6 +502,12 @@ def Qwen3VLModel_forward(
             else _prune_attention(attention_mask, keep_token_indices)
         )
         position_ids = position_ids[:, :, keep_token_indices]
+        if cache_position is not None:
+            cache_position = torch.arange(
+                inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+                dtype=cache_position.dtype
+            )
 
         if image_mask is not None:
             image_mask = image_mask[:, keep_token_indices, :]

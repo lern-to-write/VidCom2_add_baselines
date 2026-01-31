@@ -218,7 +218,7 @@ def _get_video_features_with_ipcv_compression(
             if ipcv_state.is_pruned:
                 full_hidden_states = ipcv_state.restore_for_as(hidden_states)
                 deepstack_feature = visual_model.deepstack_merger_list[
-                    visual_model.deepstack_visual_indexes.index(layer_num)
+                        visual_model.deepstack_visual_indexes.index(layer_num)
                 ](full_hidden_states)
             else:
                 deepstack_feature = visual_model.deepstack_merger_list[

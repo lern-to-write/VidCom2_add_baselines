@@ -98,7 +98,7 @@ def _get_video_features_with_illava_compression(
     merge_layers: List[int],
     merge_ratio_per_layer: float,
     final_retention_ratio: float,
-) -> Tuple[Tensor, List[Tensor]]:
+) -> Tuple[Tensor, List[Tensor], List[int], List[int]]:
     """
     Extract video features with iLLaVA token merging applied INSIDE the ViT.
     
@@ -115,6 +115,8 @@ def _get_video_features_with_illava_compression(
     Returns:
         hidden_states: Compressed video features after all processing
         deepstack_features: List of deepstack features (all downsampled to final size)
+        orig_token_counts: Original token counts per image/frame (before ViT merger)
+        compressed_token_counts: Compressed token counts per image/frame (before ViT merger)
     """
     # Patch embedding
     hidden_states = visual_model.patch_embed(pixel_values)
@@ -137,6 +139,10 @@ def _get_video_features_with_illava_compression(
         grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
     ).cumsum(dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+    
+    # Track original token counts per image/frame (before any merging, after patch embed)
+    # Each image/frame has grid_thw[i, 1] * grid_thw[i, 2] tokens per time step
+    orig_token_counts_per_segment = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     
     # Track whether merging has been applied (affects deepstack feature collection)
     merging_applied = False
@@ -231,11 +237,16 @@ def _get_video_features_with_illava_compression(
                 ](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
     
-    # Get final token count before merger (this is what LLM will see)
-    final_token_count = hidden_states.shape[0]
+    # Get compressed token counts per segment from final cu_seqlens (before ViT merger)
+    compressed_token_counts_per_segment = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     
-    # Final merger for hidden states
+    # Final merger for hidden states (spatial_merge_size^2 tokens -> 1 token)
     hidden_states = visual_model.merger(hidden_states)
+    
+    # Compute final token counts after the spatial merger
+    spatial_merge_factor = visual_model.spatial_merge_size ** 2
+    orig_token_counts = [count // spatial_merge_factor for count in orig_token_counts_per_segment]
+    compressed_token_counts = [count // spatial_merge_factor for count in compressed_token_counts_per_segment]
     
     # Downsample all deepstack features to match final token count
     # This ensures deepstack features match the compressed sequence length
@@ -249,7 +260,18 @@ def _get_video_features_with_illava_compression(
             )
         deepstack_feature_lists = downsampled_deepstack
     
-    return hidden_states, deepstack_feature_lists
+    # Print compression info
+    total_orig = sum(orig_token_counts)
+    total_compressed = sum(compressed_token_counts)
+    print(f"[iLLaVA] Token Merging Applied:")
+    print(f"  - Number of images/frames: {len(orig_token_counts)}")
+    print(f"  - Total original tokens: {total_orig}")
+    print(f"  - Total compressed tokens: {total_compressed}")
+    print(f"  - Overall retention ratio: {total_compressed / total_orig * 100:.2f}%")
+    for i, (orig, comp) in enumerate(zip(orig_token_counts, compressed_token_counts)):
+        print(f"  - Image/Frame {i + 1}: {orig} -> {comp} tokens ({comp / orig * 100:.2f}%)")
+    
+    return hidden_states, deepstack_feature_lists, orig_token_counts, compressed_token_counts
 
 
 def Qwen3VLModel_forward(
@@ -275,7 +297,6 @@ def Qwen3VLModel_forward(
     - ILLAVA_LAYERS: Comma-separated layer indices for merging (default: auto)
     - COMPRESS_IMAGE: Set to "1" to enable image compression (default: "0")
     """
-
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -286,6 +307,12 @@ def Qwen3VLModel_forward(
     video_mask = None
     deepstack_image_embeds = None
     deepstack_video_embeds = None
+    
+    # Token count tracking for multi-image/video support
+    image_orig_token_counts = None
+    image_compressed_token_counts = None
+    video_orig_token_counts = None
+    video_compressed_token_counts = None
 
     # Check if image compression should be applied
     image_compression_on = (
@@ -316,7 +343,12 @@ def Qwen3VLModel_forward(
                 merge_layers = [num_blocks // 3, 2 * num_blocks // 3]
             
             pixel_values_typed = pixel_values.type(self.visual.dtype)
-            image_embeds_raw, deepstack_image_embeds = _get_video_features_with_illava_compression(
+            (
+                image_embeds_raw,
+                deepstack_image_embeds,
+                image_orig_token_counts,
+                image_compressed_token_counts,
+            ) = _get_video_features_with_illava_compression(
                 self.visual,
                 pixel_values_typed,
                 image_grid_thw,
@@ -368,7 +400,12 @@ def Qwen3VLModel_forward(
                 merge_layers = [num_blocks // 3, 2 * num_blocks // 3]
             
             pixel_values_videos_typed = pixel_values_videos.type(self.visual.dtype)
-            video_embeds_raw, deepstack_video_embeds = _get_video_features_with_illava_compression(
+            (
+                video_embeds_raw,
+                deepstack_video_embeds,
+                video_orig_token_counts,
+                video_compressed_token_counts,
+            ) = _get_video_features_with_illava_compression(
                 self.visual,
                 pixel_values_videos_typed,
                 video_grid_thw,
@@ -446,16 +483,28 @@ def Qwen3VLModel_forward(
             return attn[:, :, indices, :][:, :, :, indices]
         return attn
 
-    if image_compression_on:
-        # Prune sequence to match compressed image tokens
+    if image_compression_on and image_orig_token_counts is not None:
+        # Prune sequence to match compressed image tokens (multi-image aware)
         image_token_positions = image_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
-        num_compressed_image_tokens = len(image_embeds)
+        
+        # For multi-image: each image has orig_token_counts[i] original tokens
+        # and compressed_token_counts[i] compressed tokens. We need to keep the
+        # first compressed_token_counts[i] positions for each image.
+        kept_image_positions_list = []
+        offset = 0
+        for orig_count, comp_count in zip(image_orig_token_counts, image_compressed_token_counts):
+            # Get positions for this image
+            image_positions = image_token_positions[offset:offset + orig_count]
+            # Keep first comp_count positions
+            kept_image_positions_list.append(image_positions[:comp_count])
+            offset += orig_count
+        
+        kept_image_positions = torch.cat(kept_image_positions_list) if kept_image_positions_list else image_token_positions[:0]
         
         all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
         non_image_mask = ~image_mask[..., 0][0]
         non_image_positions = all_positions[non_image_mask]
         
-        kept_image_positions = image_token_positions[:num_compressed_image_tokens]
         keep_token_indices = torch.cat((non_image_positions, kept_image_positions)).sort().values
 
         inputs_embeds = inputs_embeds[:, keep_token_indices, :]
@@ -481,16 +530,28 @@ def Qwen3VLModel_forward(
 
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
 
-    if compression_on:
-        # Prune sequence to match compressed video tokens
+    if compression_on and video_orig_token_counts is not None:
+        # Prune sequence to match compressed video tokens (multi-frame aware)
         video_token_positions = video_mask[..., 0][0].nonzero(as_tuple=False).squeeze(-1)
-        num_compressed_tokens = len(video_embeds)
+        
+        # For multi-frame video: each frame has orig_token_counts[i] original tokens
+        # and compressed_token_counts[i] compressed tokens. We need to keep the
+        # first compressed_token_counts[i] positions for each frame.
+        kept_video_positions_list = []
+        offset = 0
+        for orig_count, comp_count in zip(video_orig_token_counts, video_compressed_token_counts):
+            # Get positions for this frame
+            frame_positions = video_token_positions[offset:offset + orig_count]
+            # Keep first comp_count positions
+            kept_video_positions_list.append(frame_positions[:comp_count])
+            offset += orig_count
+        
+        kept_video_positions = torch.cat(kept_video_positions_list) if kept_video_positions_list else video_token_positions[:0]
         
         all_positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
         non_video_mask = ~video_mask[..., 0][0]
         non_video_positions = all_positions[non_video_mask]
         
-        kept_video_positions = video_token_positions[:num_compressed_tokens]
         keep_token_indices = torch.cat((non_video_positions, kept_video_positions)).sort().values
 
         inputs_embeds = inputs_embeds[:, keep_token_indices, :]

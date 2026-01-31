@@ -378,7 +378,7 @@ CUDA_VISIBLE_DEVICES=6,7 COMPRESSOR=ipcv COMPRESS_IMAGE=1 R_RATIO=0.25 IPCV_LAYE
   --output_path ./logs/
 
 # iLLaVA with image compression enabled
-CUDA_VISIBLE_DEVICES=6,7 COMPRESSOR=illava COMPRESS_IMAGE=1 ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=2 \
+CUDA_VISIBLE_DEVICES=7 COMPRESSOR=illava COMPRESS_IMAGE=1 ILLAVA_MERGE_RATIO=0.16 ILLAVA_LAYERS=12,13,14,15 accelerate launch --num_processes=1 \
   -m lmms_eval \
   --model qwen3_vl \
   --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa \
@@ -404,7 +404,7 @@ CUDA_VISIBLE_DEVICES=7 COMPRESSOR=cdpruner COMPRESS_IMAGE=1 CDPRUNER_TOKENS=128 
   -m lmms_eval \
   --model qwen3_vl \
   --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,attn_implementation=sdpa \
-  --tasks mme \
+  --tasks mmt_mi_val \
   --batch_size 1 \
   --log_samples \
   --log_samples_suffix qwen3_vl_cdpruner_image \
